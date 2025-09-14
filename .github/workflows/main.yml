@@ -1,0 +1,170 @@
+name: Advanced RDP Server - Persistent Session
+on: 
+  workflow_dispatch:
+    inputs:
+      deployment_days:
+        description: 'Number of days to maintain deployment (max 180)'
+        required: true
+        default: '180'
+
+jobs:
+  deploy-persistent-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 600  # 10 ساعات
+    strategy:
+      matrix:
+        days: ${{ fromJson(format('[{0}]', github.event.inputs.deployment_days || 180)) }}
+    
+    steps:
+    - name: Configure Persistent RDP Settings
+      run: |
+        # تفعيل RDP وتعطيل المصادقة
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+        
+        # إعدادات الجلسة الدائمة
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MaxConnectionTime" -Value 36000000 -Force
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MaxIdleTime" -Value 36000000 -Force
+        
+        # حفظ حالة الجلسة عند الانقطاع
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "fResetBroken" -Value 0 -Force
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "KeepAliveEnable" -Value 1 -Force
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "KeepAliveInterval" -Value 60000 -Force
+        
+        # فتح منفذ RDP
+        netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+        
+        Restart-Service -Name TermService -Force
+
+    - name: Create Persistent User Account
+      run: |
+        # إنشاء المستخدم الثابت
+        $securePassword = ConvertTo-SecureString "abdalli@100" -AsPlainText -Force
+        $userName = "Abdalli"
+        
+        # حذف المستخدم إذا كان موجوداً مسبقاً
+        if (Get-LocalUser -Name $userName -ErrorAction SilentlyContinue) {
+            Remove-LocalUser -Name $userName -Force
+        }
+        
+        # إنشاء المستخدم الجديد
+        New-LocalUser -Name $userName -Password $securePassword -AccountNeverExpires -PasswordNeverExpires
+        Add-LocalGroupMember -Group "Administrators" -Member $userName
+        Add-LocalGroupMember -Group "Remote Desktop Users" -Member $userName
+        
+        # تعيين مجلد ملفات المستخدم دائم التخزين
+        $userProfilePath = "C:\Users\$userName"
+        if (Test-Path $userProfilePath) {
+            Remove-Item -Path $userProfilePath -Recurse -Force
+        }
+        
+        echo "RDP_USERNAME=$userName" >> $env:GITHUB_ENV
+        echo "RDP_PASSWORD=abdalli@100" >> $env:GITHUB_ENV
+
+    - name: Install Tailscale for Secure Access
+      run: |
+        $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+        $installerPath = "$env:TEMP\tailscale.msi"
+        
+        Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+        Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+        Remove-Item $installerPath -Force
+        
+        & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-persistent-rdp-$env:GITHUB_RUN_ID --advertise-exit-node
+        
+        $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+        echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+    - name: Install Development Tools with Persistence
+      run: |
+        # تحديث النظام
+        winget install --id Microsoft.WindowsTerminal -e --source winget --accept-package-agreements
+        
+        # أدوات التطوير الأساسية
+        winget install --id Git.Git -e --source winget
+        winget install --id Microsoft.VisualStudioCode -e --source winget
+        winget install --id Python.Python.3.12 -e --source winget
+        winget install --id OpenJS.NodeJS.LTS -e --source winget
+        winget install --id Microsoft.DotNet.SDK.8 -e --source winget
+        
+        # أدوات مساعدة
+        winget install --id 7zip.7zip -e --source winget
+        winget install --id Google.Chrome -e --source winget
+
+    - name: Configure Profile Persistence
+      run: |
+        # تكوين حفظ حالة المستخدم
+        $userName = "Abdalli"
+        $profilePath = "C:\Users\$userName"
+        
+        # إنشاء مجلدات لحفظ البيانات
+        $persistentFolders = @("Documents", "Desktop", "Downloads", "AppData")
+        foreach ($folder in $persistentFolders) {
+            $fullPath = "$profilePath\$folder"
+            if (!(Test-Path $fullPath)) {
+                New-Item -Path $fullPath -ItemType Directory -Force
+            }
+        }
+        
+        # تكوين سياسات حفظ الجلسة
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "DeleteTempDirsOnExit" -Value 0 -Force
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "PerSessionTempDir" -Value 0 -Force
+
+    - name: Setup Automatic Backup
+      run: |
+        # إنشاء سكريبت للنسخ الاحتياطي التلقائي
+        $backupScript = @"
+        `$backupSource = "C:\Users\Abdalli"
+        `$backupDest = "C:\PersistentBackup"
+        `$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+        
+        if (!(Test-Path `$backupDest)) {
+            New-Item -Path `$backupDest -ItemType Directory -Force
+        }
+        
+        # نسخ احتياطي للملفات المهمة
+        `$importantFiles = @("Documents", "Desktop", "Downloads")
+        foreach (`$dir in `$importantFiles) {
+            `$sourceDir = "`$backupSource\`$dir"
+            `$destDir = "`$backupDest\`$dir_`$timestamp"
+            if (Test-Path `$sourceDir) {
+                Copy-Item -Path `$sourceDir -Destination `$destDir -Recurse -Force
+            }
+        }
+        
+        Write-Host "Backup completed at `$timestamp"
+"@
+        Set-Content -Path "C:\Scripts\AutoBackup.ps1" -Value $backupScript -Force
+        
+        # مهمة مجدولة للنسخ الاحتياطي اليومي
+        $action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-ExecutionPolicy Bypass -File C:\Scripts\AutoBackup.ps1"
+        $trigger = New-ScheduledTaskTrigger -Daily -At "23:00"
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+        Register-ScheduledTask -TaskName "DailyUserBackup" -Action $action -Trigger $trigger -Settings $settings -User "System" -Force
+
+    - name: Start Persistent RDP Session
+      run: |
+        # بدء الخدمات
+        Start-Service -Name TermService
+        Start-ScheduledTask -TaskName "DailyUserBackup"
+        
+        # عرض معلومات الاتصال
+        Write-Host "=============================================="
+        Write-Host "       PERSISTENT RDP SERVER DEPLOYED"
+        Write-Host "=============================================="
+        Write-Host "Username: Abdalli"
+        Write-Host "Password: abdalli@100"
+        Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+        Write-Host "Session Duration: 10 hours daily"
+        Write-Host "Total Deployment: ${{ github.event.inputs.deployment_days || 180 }} days"
+        Write-Host "Profile Persistence: Enabled"
+        Write-Host "Auto Backup: Daily at 23:00"
+        Write-Host "=============================================="
+        
+        # الحفاظ على الجلسة نشطة
+        $endTime = (Get-Date).AddHours(10)
+        while ((Get-Date) -lt $endTime) {
+            $remaining = ($endTime - (Get-Date)).ToString("hh\:mm\:ss")
+            Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Session active - Time remaining: $remaining"
+            Start-Sleep -Seconds 300
+        }
