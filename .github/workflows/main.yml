@@ -27,6 +27,7 @@ jobs:
         Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MaxIdleTime" -Value 36000000 -Force
         
         # حفظ حالة الجلسة عند الانقطاع
+        New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Force -ErrorAction SilentlyContinue
         Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "fResetBroken" -Value 0 -Force
         Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "KeepAliveEnable" -Value 1 -Force
         Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "KeepAliveInterval" -Value 60000 -Force
@@ -67,7 +68,7 @@ jobs:
         $installerPath = "$env:TEMP\tailscale.msi"
         
         Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-        Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+        Start-Process msiexec.exe -ArgumentList "/i", "$installerPath", "/quiet", "/norestart" -Wait
         Remove-Item $installerPath -Force
         
         & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-persistent-rdp-$env:GITHUB_RUN_ID --advertise-exit-node
@@ -112,8 +113,11 @@ jobs:
 
     - name: Setup Automatic Backup
       run: |
+        # إنشاء مجلد البرامج النصية
+        New-Item -Path "C:\Scripts" -ItemType Directory -Force -ErrorAction SilentlyContinue
+        
         # إنشاء سكريبت للنسخ الاحتياطي التلقائي
-        $backupScript = @"
+        $backupScript = @'
         `$backupSource = "C:\Users\Abdalli"
         `$backupDest = "C:\PersistentBackup"
         `$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
@@ -133,7 +137,7 @@ jobs:
         }
         
         Write-Host "Backup completed at `$timestamp"
-"@
+'@
         Set-Content -Path "C:\Scripts\AutoBackup.ps1" -Value $backupScript -Force
         
         # مهمة مجدولة للنسخ الاحتياطي اليومي
@@ -145,8 +149,7 @@ jobs:
     - name: Start Persistent RDP Session
       run: |
         # بدء الخدمات
-        Start-Service -Name TermService
-        Start-ScheduledTask -TaskName "DailyUserBackup"
+        Start-Service -Name TermService -ErrorAction SilentlyContinue
         
         # عرض معلومات الاتصال
         Write-Host "=============================================="
